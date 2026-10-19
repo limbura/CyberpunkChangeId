@@ -614,7 +614,7 @@ class App:
             choice = await self.ui.ask("1 — попробовать печать ещё раз\n2 — заполнить вручную", choices={"1", "2"})
             self.go(Stage.REMOVE if choice == "1" else Stage.MANUAL)
         elif s == Stage.REMOVE:
-            await self.ui.acknowledge("Отклей от вышедшей ленты все доступные наклейки. Испорченные выброси.")
+            await self.ui.acknowledge("Отклей от вышедшей ленты все доступные наклейки и выброси их.")
             self.printer.removed = True
             self.go(Stage.PRINT)
         elif s == Stage.MANUAL:
@@ -667,7 +667,7 @@ class App:
             # Reconnect does not automatically duplicate a possibly printed job.
             self.go(Stage.LABEL, notice="Связь восстановлена. Проверь результат прерванной печати.")
         else:
-            self.go(Stage.RETRY, notice="Неизвестная ошибка печати")
+            self.go(Stage.RETRY, notice="Ошибка печати")
 
     async def run(self):
         signal.signal(signal.SIGINT, self.signal)
