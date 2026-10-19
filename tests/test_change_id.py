@@ -324,3 +324,93 @@ class InputAndReaderTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PrinterServiceTests(unittest.IsolatedAsyncioTestCase):
+    def make_printer(self):
+        c = dict(m.DEFAULTS['printer'], reconnect_delay=0.001, connection_check_interval=0.001)
+        p = m.Printer(c)
+        self.addAsyncCleanup(p.close)
+        return p
+
+    async def test_start_connects_without_printing(self):
+        p = self.make_printer()
+        connected = asyncio.Event()
+        async def once():
+            connected.set()
+        p._connect_once = AsyncMock(side_effect=once)
+        p.start()
+        await asyncio.wait_for(connected.wait(), 1)
+        self.assertGreaterEqual(p._connect_once.await_count, 1)
+        self.assertIsNone(p.device)
+
+    async def test_background_retries_and_keeps_monitoring(self):
+        p = self.make_printer()
+        recovered = asyncio.Event()
+        calls = 0
+        async def once():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise ConnectionError()
+            recovered.set()
+        p._connect_once = once
+        p.start()
+        await asyncio.wait_for(recovered.wait(), 1)
+        self.assertGreaterEqual(calls, 3)
+
+    async def test_foreground_budget_and_shared_inflight_attempt(self):
+        p = self.make_printer()
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = 0
+        async def once():
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            raise ConnectionError()
+        p._connect_once = once
+        p.start()
+        await entered.wait()
+        foreground = asyncio.create_task(p.connect())
+        await asyncio.sleep(0)
+        release.set()
+        with self.assertRaises(ConnectionError):
+            await foreground
+        self.assertEqual(calls, p.config['connect_attempts'])
+
+    async def test_monitor_reconnects_on_lost_link(self):
+        p = self.make_printer()
+        p.device = Mock()
+        p.device.check_connection = AsyncMock(side_effect=[True, False])
+        p.device.disconnect = AsyncMock()
+        p.device.connect = AsyncMock()
+        await p._connect_once()
+        p.device.connect.assert_not_awaited()
+        await p._connect_once()
+        p.device.connect.assert_awaited_once_with(p.config['address'])
+
+    async def test_connection_waits_for_print_io_lock(self):
+        p = self.make_printer()
+        p.device = Mock()
+        p.device.check_connection = AsyncMock(return_value=True)
+        p.device.disconnect = AsyncMock()
+        async with p._io:
+            attempt = asyncio.create_task(p._shared_attempt())
+            await asyncio.sleep(0.01)
+            p.device.check_connection.assert_not_awaited()
+        await attempt
+        p.device.check_connection.assert_awaited_once()
+
+    async def test_close_cancels_pending_attempt(self):
+        p = self.make_printer()
+        entered = asyncio.Event()
+        async def once():
+            entered.set()
+            await asyncio.Event().wait()
+        p._connect_once = once
+        p.start()
+        await entered.wait()
+        await p.close()
+        self.assertTrue(p._monitor.done())
+        self.assertTrue(p._attempt.done())

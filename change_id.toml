@@ -26,7 +26,10 @@ timini_path = "../TiMini-Print"
 address = "EB:11:06:26:77:26"
 timeout = 20.0
 scan_timeout = 10.0
+# Число попыток, ожидаемых перед печатью (включая текущую фоновую).
 connect_attempts = 1
+reconnect_delay = 5.0
+connection_check_interval = 2.0
 mode = "id-name" # Или "id-only".
 roll_width_mm = 40.0
 width_mm = 40.0
@@ -43,3 +46,4 @@ motion_settle_seconds = 5.0
 [logging]
 # Диагностический журнал отключён. Сохранение состояния работает всегда.
 enabled = true
+

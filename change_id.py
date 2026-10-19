@@ -37,6 +37,7 @@ DEFAULTS = {
     "printer": {"library_path": "../CyberpunkIdPrinter/src",
                 "timini_path": "../TiMini-Print", "address": "EB:11:06:26:77:26",
                 "timeout": 20.0, "scan_timeout": 15.0, "connect_attempts": 2,
+                "reconnect_delay": 5.0, "connection_check_interval": 2.0,
                 "mode": "id-name", "roll_width_mm": 40.0,
                 "width_mm": 40.0, "height_mm": 30.0, "offset_x_mm": 0.0,
                 "feed_mm": 15.0, "retract_mm": 25.0,
@@ -379,6 +380,34 @@ class Printer:
         self.config = config
         self.device = None
         self.removed = False
+        self._io = asyncio.Lock()
+        self._attempt = None
+        self._monitor = None
+        self._foreground = 0
+
+    def start(self):
+        """Start monitoring without delaying the menu or moving paper."""
+        if self._monitor is None:
+            self._monitor = asyncio.create_task(self._watch())
+
+    async def _watch(self):
+        while True:
+            if self._foreground:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                await self._shared_attempt()
+                delay = self.config["connection_check_interval"]
+            except Exception:
+                LOG.debug("Background printer connection failed", exc_info=True)
+                delay = self.config["reconnect_delay"]
+            await asyncio.sleep(delay)
+
+    async def _shared_attempt(self):
+        # Foreground waits for an already running attempt; never a second BLE job.
+        if self._attempt is None or self._attempt.done():
+            self._attempt = asyncio.create_task(self._connect_once())
+        await asyncio.shield(self._attempt)
 
     def create(self):
         from cyberwall_id_printer import LabelPrinter, LabelSettings, MediaConfig, PaperType
@@ -390,35 +419,64 @@ class Printer:
             settings=LabelSettings(**{k: c[k] for k in (
                 "feed_mm", "retract_mm", "position_timeout", "settle_seconds", "motion_settle_seconds")}),
             timeout=c["timeout"], scan_timeout=c["scan_timeout"],
-            connect_attempts=c["connect_attempts"],
+            connect_attempts=1,  # Retry budget belongs to this service, not the backend.
             on_event=lambda event: LOG.debug("printer %s", event))
 
+    async def _connect_once(self):
+        async with self._io:
+            if self.device is None:
+                self.create()
+            if await self.device.check_connection():
+                return
+            await self.device.disconnect()
+            LOG.debug("Printer connection attempt")
+            await self.device.connect(self.config["address"])
+            self.removed = False
+
     async def connect(self):
-        if self.device is None:
-            self.create()
-        if await self.device.check_connection():
-            return
-        await self.device.disconnect()
-        print("Подключаюсь к термопринтеру…", flush=True)
-        await self.device.connect(self.config["address"])
-        self.removed = False
+        """Wait for at most N attempts from now, including one already in flight.
+
+        Earlier background failures do not consume the print-stage budget.
+        The monitor remains active after this method fails (manual mode).
+        """
+        self._foreground += 1
+        try:
+            for attempt in range(self.config["connect_attempts"]):
+                try:
+                    await self._shared_attempt()
+                    return
+                except Exception:
+                    if attempt + 1 == self.config["connect_attempts"]:
+                        raise
+                    await asyncio.sleep(self.config["reconnect_delay"])
+        finally:
+            self._foreground -= 1
 
     async def alive(self):
-        return self.device is not None and await self.device.check_connection()
+        async with self._io:
+            return self.device is not None and await self.device.check_connection()
 
     async def print_id(self, number, name):
         from cyberwall_id_printer import LabelMode
-        if self.device.state.value == "presented" and self.removed:
-            await self.device.confirm_removed()
-        self.removed = False
-        await self.device.print_id(str(number), name, mode=LabelMode(self.config["mode"]))
+        # No background status query/reconnect during paper motion or printing.
+        async with self._io:
+            if self.device.state.value == "presented" and self.removed:
+                await self.device.confirm_removed()
+            self.removed = False
+            await self.device.print_id(str(number), name, mode=LabelMode(self.config["mode"]))
 
     async def close(self):
-        if self.device is not None:
-            try:
-                await self.device.disconnect()
-            except Exception:
-                LOG.debug("Disconnect failed", exc_info=True)
+        tasks = [task for task in (self._monitor, self._attempt) if task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._io:
+            if self.device is not None:
+                try:
+                    await self.device.disconnect()
+                except Exception:
+                    LOG.debug("Disconnect failed", exc_info=True)
 
 
 class App:
@@ -522,6 +580,7 @@ class App:
                 self.go(Stage.PRINT, new_id=number)
         elif s == Stage.PRINT:
             try:
+                print("Проверяю подключение к термопринтеру…", flush=True)
                 await self.printer.connect()
             except Exception:
                 LOG.debug("Printer connection failed", exc_info=True)
@@ -651,7 +710,7 @@ def load_config(path):
         for key in keys:
             if type(config[section][key]) is not int or config[section][key] <= 0:
                 raise ValueError(section + "." + key)
-    for key in ("timeout", "scan_timeout", "width_mm", "height_mm", "roll_width_mm",
+    for key in ("timeout", "scan_timeout", "reconnect_delay", "connection_check_interval", "width_mm", "height_mm", "roll_width_mm",
                 "feed_mm", "retract_mm", "position_timeout", "settle_seconds", "motion_settle_seconds"):
         value = config["printer"][key]
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
@@ -691,6 +750,7 @@ async def run(config):
     printer = Printer(config["printer"])
     try:
         app = App(config, store, Console(), Database(config["database"]), Reader(config["reader"]), printer)
+        printer.start()
         await app.run()
     finally:
         await printer.close()
@@ -728,3 +788,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
