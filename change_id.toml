@@ -1,0 +1,45 @@
+# Все пути считаются от расположения change_id.py, независимо от текущей папки.
+[database]
+host = "188.134.70.190"
+port = 3306
+user = "master"
+name = "cyberwall"
+# Можно оставить пустым: скрипт спросит пароль при первом обращении к БД.
+# Переменная CYBERWALL_DB_PASSWORD имеет приоритет над этим значением.
+password = "master"
+connect_timeout = 5
+read_timeout = 15
+write_timeout = 15
+# Автоматические попытки CALL. Счётчик сохраняется при перезапуске.
+attempts = 2
+
+[reader]
+library_path = "../CyberpunkPcRfidReader/wcopy_reader_package"
+timeout_ms = 750
+poll_interval = 0.25
+# «Нет карты» не расходует попытки и не ограничено по времени.
+attempts = 5
+
+[printer]
+library_path = "../CyberpunkIdPrinter/src"
+timini_path = "../TiMini-Print"
+address = "EB:11:06:26:77:26"
+timeout = 20.0
+scan_timeout = 10.0
+connect_attempts = 1
+mode = "id-name" # Или "id-only".
+roll_width_mm = 40.0
+width_mm = 40.0
+height_mm = 30.0
+# 0 = по центру головки. Для прежнего смещения влево укажи -4.0.
+offset_x_mm = -4.0
+# Текущие значения из примера labels_v2. При необходимости выставь проверенные на своём принтере.
+feed_mm = 15.0
+retract_mm = 25.0
+position_timeout = 20.0
+settle_seconds = 3.0
+motion_settle_seconds = 5.0
+
+[logging]
+# Диагностический журнал отключён. Сохранение состояния работает всегда.
+enabled = true

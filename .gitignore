@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+change_id_state.sqlite3*
+change_id.lock
+change_id_debug.log*
+change_id.local.toml
