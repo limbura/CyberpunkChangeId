@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import change_id as m
@@ -414,3 +416,47 @@ class PrinterServiceTests(unittest.IsolatedAsyncioTestCase):
         await p.close()
         self.assertTrue(p._monitor.done())
         self.assertTrue(p._attempt.done())
+
+
+
+class PrintWarningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_unsupported_characters_warning_is_silenced(self):
+        class UnsupportedNameCharactersWarning(UserWarning):
+            pass
+        class NameTruncatedWarning(UserWarning):
+            pass
+        class InvalidNameWarning(UserWarning):
+            pass
+        api = SimpleNamespace(LabelMode=lambda value: value,
+                              UnsupportedNameCharactersWarning=UnsupportedNameCharactersWarning)
+        completed = []
+        async def print_id(*args, **kwargs):
+            warnings.warn("unsupported", UnsupportedNameCharactersWarning)
+            warnings.warn("truncated", NameTruncatedWarning)
+            warnings.warn("invalid", InvalidNameWarning)
+            completed.append(args)
+        printer = m.Printer(dict(m.DEFAULTS['printer']))
+        printer.device = SimpleNamespace(state=SimpleNamespace(value='ready'),
+                                         print_id=print_id)
+        with patch.dict(sys.modules, cyberwall_id_printer=api), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await printer.print_id(123456789, 'А@')
+            warnings.warn("outside print", UnsupportedNameCharactersWarning)
+        self.assertEqual(completed, [('123456789', 'А@')])
+        self.assertEqual([item.category for item in caught],
+                         [NameTruncatedWarning, InvalidNameWarning, UnsupportedNameCharactersWarning])
+
+    async def test_print_error_propagates_and_filter_is_restored(self):
+        class UnsupportedNameCharactersWarning(UserWarning):
+            pass
+        api = SimpleNamespace(LabelMode=lambda value: value,
+                              UnsupportedNameCharactersWarning=UnsupportedNameCharactersWarning)
+        printer = m.Printer(dict(m.DEFAULTS['printer']))
+        printer.device = SimpleNamespace(state=SimpleNamespace(value='ready'),
+                                         print_id=AsyncMock(side_effect=OSError("disconnected")))
+        with patch.dict(sys.modules, cyberwall_id_printer=api), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with self.assertRaisesRegex(OSError, "disconnected"):
+                await printer.print_id(123456789, 'А@')
+            warnings.warn("outside print", UnsupportedNameCharactersWarning)
+        self.assertEqual(len(caught), 1)

@@ -23,6 +23,7 @@ import signal
 import sqlite3
 import sys
 import tomllib
+import warnings
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 
@@ -457,13 +458,15 @@ class Printer:
             return self.device is not None and await self.device.check_connection()
 
     async def print_id(self, number, name):
-        from cyberwall_id_printer import LabelMode
+        from cyberwall_id_printer import LabelMode, UnsupportedNameCharactersWarning
         # No background status query/reconnect during paper motion or printing.
         async with self._io:
             if self.device.state.value == "presented" and self.removed:
                 await self.device.confirm_removed()
             self.removed = False
-            await self.device.print_id(str(number), name, mode=LabelMode(self.config["mode"]))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UnsupportedNameCharactersWarning)
+                await self.device.print_id(str(number), name, mode=LabelMode(self.config["mode"]))
 
     async def close(self):
         tasks = [task for task in (self._monitor, self._attempt) if task is not None]
@@ -788,4 +791,5 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
