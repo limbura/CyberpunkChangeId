@@ -100,7 +100,10 @@ def formatted_id(number):
 
 def safe_name(name):
     # Never render control characters obtained from an account name.
-    return "".join(c for c in str(name or "Без имени") if c.isprintable())
+    text = str(name or "Без имени")
+    if text.isspace():
+        text = "Без имени"
+    return "".join(c for c in text if c.isprintable())
 
 
 class StateError(Exception):
