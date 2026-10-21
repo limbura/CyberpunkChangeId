@@ -420,7 +420,7 @@ class PrinterServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PrintWarningTests(unittest.IsolatedAsyncioTestCase):
-    async def test_only_unsupported_characters_warning_is_silenced(self):
+    async def test_name_warnings_show_messages_and_print_continues(self):
         class UnsupportedNameCharactersWarning(UserWarning):
             pass
         class NameTruncatedWarning(UserWarning):
@@ -428,29 +428,44 @@ class PrintWarningTests(unittest.IsolatedAsyncioTestCase):
         class InvalidNameWarning(UserWarning):
             pass
         api = SimpleNamespace(LabelMode=lambda value: value,
-                              UnsupportedNameCharactersWarning=UnsupportedNameCharactersWarning)
+                              UnsupportedNameCharactersWarning=UnsupportedNameCharactersWarning,
+                              NameTruncatedWarning=NameTruncatedWarning,
+                              InvalidNameWarning=InvalidNameWarning)
         completed = []
         async def print_id(*args, **kwargs):
             warnings.warn("unsupported", UnsupportedNameCharactersWarning)
             warnings.warn("truncated", NameTruncatedWarning)
             warnings.warn("invalid", InvalidNameWarning)
+            warnings.warn("truncated again", NameTruncatedWarning)
+            warnings.warn("unrelated", RuntimeWarning)
             completed.append(args)
         printer = m.Printer(dict(m.DEFAULTS['printer']))
         printer.device = SimpleNamespace(state=SimpleNamespace(value='ready'),
                                          print_id=print_id)
         with patch.dict(sys.modules, cyberwall_id_printer=api), warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            await printer.print_id(123456789, 'А@')
+            with patch('builtins.print') as output:
+                await printer.print_id(123456789, 'А@')
+            self.assertEqual([call.args for call in output.call_args_list], [
+                ("Слишком длинное имя обрезано",),
+                ("Некорректное или пустое имя, напиши имя на наклейке вручную и сообщи мастерам",),
+            ])
             warnings.warn("outside print", UnsupportedNameCharactersWarning)
         self.assertEqual(completed, [('123456789', 'А@')])
         self.assertEqual([item.category for item in caught],
-                         [NameTruncatedWarning, InvalidNameWarning, UnsupportedNameCharactersWarning])
+                         [RuntimeWarning, UnsupportedNameCharactersWarning])
 
     async def test_print_error_propagates_and_filter_is_restored(self):
         class UnsupportedNameCharactersWarning(UserWarning):
             pass
+        class NameTruncatedWarning(UserWarning):
+            pass
+        class InvalidNameWarning(UserWarning):
+            pass
         api = SimpleNamespace(LabelMode=lambda value: value,
-                              UnsupportedNameCharactersWarning=UnsupportedNameCharactersWarning)
+                              UnsupportedNameCharactersWarning=UnsupportedNameCharactersWarning,
+                              NameTruncatedWarning=NameTruncatedWarning,
+                              InvalidNameWarning=InvalidNameWarning)
         printer = m.Printer(dict(m.DEFAULTS['printer']))
         printer.device = SimpleNamespace(state=SimpleNamespace(value='ready'),
                                          print_id=AsyncMock(side_effect=OSError("disconnected")))

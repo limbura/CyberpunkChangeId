@@ -458,15 +458,37 @@ class Printer:
             return self.device is not None and await self.device.check_connection()
 
     async def print_id(self, number, name):
-        from cyberwall_id_printer import LabelMode, UnsupportedNameCharactersWarning
+        from cyberwall_id_printer import (
+            LabelMode, UnsupportedNameCharactersWarning, NameTruncatedWarning, InvalidNameWarning,
+        )
         # No background status query/reconnect during paper motion or printing.
         async with self._io:
             if self.device.state.value == "presented" and self.removed:
                 await self.device.confirm_removed()
             self.removed = False
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UnsupportedNameCharactersWarning)
-                await self.device.print_id(str(number), name, mode=LabelMode(self.config["mode"]))
+            messages = {
+                NameTruncatedWarning: "Слишком длинное имя обрезано",
+                InvalidNameWarning: "Некорректное или пустое имя, напиши имя на наклейке вручную и сообщи мастерам",
+            }
+            caught = []
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("ignore", UnsupportedNameCharactersWarning)
+                    for category in messages:
+                        warnings.simplefilter("always", category)
+                    await self.device.print_id(str(number), name, mode=LabelMode(self.config["mode"]))
+            finally:
+                displayed = set()
+                for warning in caught:
+                    category = next((kind for kind in messages
+                                     if issubclass(warning.category, kind)), None)
+                    if category is None:
+                        warnings.showwarning(warning.message, warning.category,
+                                             warning.filename, warning.lineno,
+                                             line=warning.line)
+                    elif category not in displayed:
+                        print(messages[category])
+                        displayed.add(category)
 
     async def close(self):
         tasks = [task for task in (self._monitor, self._attempt) if task is not None]
