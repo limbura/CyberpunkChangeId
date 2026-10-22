@@ -786,6 +786,7 @@ async def run(config):
 
 
 def main():
+    print("\033[92m", end="", flush=True)  # Цвет текста зеленый
     parser = argparse.ArgumentParser(description="CYBERWALL — смена ID игроком")
     parser.add_argument("--config", type=Path, default=BASE / "change_id.toml")
     parser.add_argument("--debug", action="store_true", help="включить технический журнал")
@@ -815,6 +816,8 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
-
+    try:
+        raise SystemExit(main())
+    finally:
+        print("\033[0m", end="", flush=True)  # Цвет текста обычный
 
