@@ -27,7 +27,7 @@ import warnings
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 LOG = logging.getLogger("change_id")
