@@ -146,7 +146,7 @@ class Store:
                     raise ValueError("missing confirmed ID")
             return op
         except (ValueError, TypeError, KeyError) as exc:
-            raise StateError("Повреждено сохранённое состояние. Позови мастера; файл не удалён.") from exc
+            raise StateError("Повреждено сохранённое состояние. Сообщи мастеру; файл не удалён.") from exc
 
     def save(self, op):
         try:
@@ -154,7 +154,7 @@ class Store:
                 self.db.execute("INSERT OR REPLACE INTO state VALUES (1, ?)",
                                 (json.dumps({"version": 1, **asdict(op)}, ensure_ascii=False),))
         except sqlite3.Error as exc:
-            raise StateError("Не удалось сохранить этап. Работа остановлена; позови мастера.") from exc
+            raise StateError("Не удалось сохранить этап. Работа остановлена; сообщи мастеру.") from exc
 
     def close(self):
         self.db.close()
@@ -320,10 +320,10 @@ class Database:
         if row and row["code"] == 1:
             raise AccountMissing
         if not row or row["code"] != 0 or not row["new_id"]:
-            raise RuntimeError("Invalid changeId response")
+            raise RuntimeError("Неправильный ответ БД после вызова процедуры changeId")
         number = int(row["new_id"])
         if not 100000000 <= number <= 999999999:
-            raise RuntimeError("ID out of range")
+            raise RuntimeError("БД вернула ID меньше 100000000 или больше 999999999")
         return number
 
 
@@ -339,7 +339,7 @@ class Reader:
         module = importlib.import_module("wcopy_reader")
         readers = await asyncio.to_thread(module.list_readers)
         if len(readers) != 1:
-            raise RuntimeError("Exactly one reader required")
+            raise RuntimeError("Должен быть подключен только один считыватель RFID")
         path = readers[0].path
         errors = 0
         feedback = True
@@ -563,10 +563,10 @@ class App:
                 raise
             except Exception:
                 LOG.debug("Reader unavailable", exc_info=True)
-                self.finish("Не удалось прочитать карту или считыватель недоступен. Попробуйте другой гейт; сообщи мастерам.")
+                self.finish("Не удалось прочитать карту или считыватель недоступен. Попробуй другой гейт; сообщи мастерам.")
             else:
                 if card == 0:
-                    self.finish("Карта не записана. Отправь владельца карты на мастерку.")
+                    self.finish("Карта не записана (пустая, card_id=0). Отправь владельца карты на мастерку.")
                 else:
                     self.go(Stage.LOOKUP, card_id=card)
         elif s == Stage.LOOKUP:
@@ -575,11 +575,11 @@ class App:
                 row = await asyncio.to_thread(self.db.lookup, self.op.card_id)
             except Exception:
                 LOG.debug("Lookup failed", exc_info=True)
-                await self.ui.acknowledge("БД недоступна. ID не менялся. Попробуй позже.", cancellable=True)
+                await self.ui.acknowledge("Нет связи с сервером. ID не менялся. Сообщи мастерам, попробуй на другом гейте.", cancellable=True)
                 self.reset()
             else:
                 if not row:
-                    self.finish("Аккаунт не найден. Отправь владельца карты на мастерку.")
+                    self.finish("Аккаунт не найден в БД. Отправь владельца карты на мастерку.")
                 else:
                     self.go(Stage.CONFIRM, name=safe_name(row["name"]), old_id=int(row["id"]))
         elif s == Stage.CONFIRM:
@@ -601,7 +601,7 @@ class App:
             try:
                 number = await asyncio.to_thread(self.db.change, self.op.card_id)
             except AccountMissing:
-                self.finish("Аккаунт не найден. Отправь владельца карты на мастерку.")
+                self.finish("Аккаунт не найден в БД. Отправь владельца карты на мастерку.")
             except Exception:
                 LOG.debug("changeId result unconfirmed", exc_info=True)
                 print("Результат не подтверждён. Повторяю подключение и смену ID…")
@@ -628,7 +628,7 @@ class App:
         elif s == Stage.LABEL:
             print(self.op.notice)
             choice = await self.ui.ask(
-                "Наклейка напечаталась, и ты наклеил её на карту ВЗАМЕН старой?\n"
+                "Наклейка напечаталась? Ты наклеил её на карту ВЗАМЕН старой?\n"
                 "1 — да, заменил\n2 — нет, попробовать напечатать ещё раз\n"
                 "3 — нет, заполнить вручную", choices={"1", "2", "3"})
             if choice == "1":
@@ -637,7 +637,7 @@ class App:
             elif choice == "2":
                 self.go(Stage.REMOVE)
             else:
-                self.go(Stage.MANUAL, notice="Не удалось получить наклейку")
+                self.go(Stage.MANUAL, notice="Не удалось напечатать наклейку")
         elif s == Stage.RETRY:
             if self.op.notice:
                 print(self.op.notice)
@@ -651,7 +651,7 @@ class App:
             print(self.op.notice + ". После смены ID сообщи об этом мастерам.")
             await self.ui.acknowledge(
                 "Возьми пустой шаблон и маркер. Наклей шаблон ВЗАМЕН старой наклейки.\n"
-                "Напиши ID: " + formatted_id(self.op.new_id) + "\nНажми 1, когда закончишь.")
+                "Напиши имя и ID: " + formatted_id(self.op.new_id) + "\nНажми 1, когда закончишь.")
             self.go(Stage.VERIFY)
         elif s == Stage.VERIFY:
             value = await self.ui.ask("Введи ID, который ты написал на наклейке:")
@@ -660,10 +660,10 @@ class App:
             else:
                 count = self.op.input_errors + 1
                 if count >= 5:
-                    self.finish("ID пять раз введён неверно. Идите с владельцем карты на мастерку.")
+                    self.finish("ID пять раз введён неверно. Непонятно как такое возможно. Идите оба с владельцем карты на мастерку.")
                 else:
                     self.go(Stage.VERIFY, input_errors=count)
-                    print("\nНеверный ID. Исправь наклейку и введи снова. Должно быть:", formatted_id(self.op.new_id))
+                    print("\nНеверный ID. Исправь и введи снова. Должно быть:", formatted_id(self.op.new_id))
         elif s == Stage.FINISH:
             # A crash on this screen must repeat the instruction, not silently
             # discard an unresolved handoff to the game masters.
@@ -687,7 +687,7 @@ class App:
         except Exception:
             alive = False
         if not alive:
-            print("Связь с принтером потеряна. Пробую переподключиться…")
+            print("Связь с принтером потеряна. Пробую переподключиться, подожди…")
             try:
                 await self.printer.connect()
             except Exception:
