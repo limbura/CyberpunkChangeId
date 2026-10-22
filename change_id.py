@@ -27,7 +27,9 @@ import warnings
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 
-BASE = Path(__file__).resolve().parent
+__version__ = "1.0.0"
+
+BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 LOG = logging.getLogger("change_id")
 DEFAULTS = {
     "database": {"host": "188.134.70.190", "port": 3306, "user": "master",
@@ -785,17 +787,43 @@ async def run(config):
         store.close()
 
 
+def release_self_test(config_path):
+    """Check bundled runtime without connecting to DB, USB or Bluetooth."""
+    load_config(config_path)
+    import hid
+    import wcopy_reader
+    import pymysql
+    import cryptography.hazmat.primitives.asymmetric.rsa
+    import bleak.backends.winrt.client
+    import bleak.backends.winrt.scanner
+    from PIL import Image
+    from cyberwall_id_printer import LabelPrinter, NameTruncatedWarning, InvalidNameWarning
+    from cyberwall_id_printer.backends.timini import _imports
+    catalog, *_ = _imports(None)
+    catalog.load()
+    Image.new("1", (8, 8)).tobytes()
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute("SELECT 1").fetchone()
+    print("CHANGE_ID_SELF_TEST_OK " + __version__)
+    return 0
+
+
 def main():
     print("\033[92m", end="", flush=True)  # Цвет текста зеленый
     parser = argparse.ArgumentParser(description="CYBERWALL — смена ID игроком")
-    parser.add_argument("--config", type=Path, default=BASE / "change_id.toml")
+    parser.add_argument("--config", type=Path, default=BASE / (
+        "config.toml" if getattr(sys, "frozen", False) else "change_id.toml"))
+    parser.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--debug", action="store_true", help="включить технический журнал")
     args = parser.parse_args()
+    if args.self_test:
+        return release_self_test(args.config)
     try:
         config = load_config(args.config)
         setup_logging(args.debug or config["logging"]["enabled"])
-        for section in ("reader", "printer"):
-            sys.path.insert(0, str((BASE / config[section]["library_path"]).resolve()))
+        if not getattr(sys, "frozen", False):
+            for section in ("reader", "printer"):
+                sys.path.insert(0, str((BASE / config[section]["library_path"]).resolve()))
         if not sys.stdin.isatty():
             print("Запусти скрипт в обычном терминале, без перенаправления ввода.")
             return 1
@@ -820,4 +848,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     finally:
         print("\033[0m", end="", flush=True)  # Цвет текста обычный
+
 
