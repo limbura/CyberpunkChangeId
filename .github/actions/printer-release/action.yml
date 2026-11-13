@@ -1,0 +1,77 @@
+name: Checkout latest stable cyberwall_id_printer release
+description: Resolve the latest published non-prerelease GitHub Release, check out its tag and verify the source version
+inputs:
+  token:
+    description: GitHub token with permission to read public release metadata
+    required: true
+  minimum-version:
+    description: Minimum cyberwall_id_printer version compatible with Change ID
+    required: false
+    default: '1.3.0'
+outputs:
+  tag:
+    description: Stable GitHub Release tag actually selected
+    value: ${{ steps.resolve.outputs.tag }}
+  version:
+    description: Verified source library version
+    value: ${{ steps.verify.outputs.version }}
+  sha:
+    description: Exact printer repository commit used in the build
+    value: ${{ steps.verify.outputs.sha }}
+runs:
+  using: composite
+  steps:
+    - name: Find latest published stable printer release
+      id: resolve
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        MINIMUM_VERSION: ${{ inputs.minimum-version }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # GitHub's /releases/latest excludes draft and prerelease versions.
+        $json = gh api repos/limbura/CyberpunkIdPrinter/releases/latest
+        if ($LASTEXITCODE -ne 0) { throw 'Не удалось получить последний стабильный релиз cyberwall_id_printer' }
+        $release = $json | ConvertFrom-Json
+        $tag = [string]$release.tag_name
+        if ($release.draft -or $release.prerelease -or $tag -cnotmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+          throw "Последний GitHub Release не является стабильным vX.Y.Z: $tag"
+        }
+        if ([version]$tag.Substring(1) -lt [version]$env:MINIMUM_VERSION) {
+          throw "Последний стабильный релиз $tag старее минимально совместимой версии $env:MINIMUM_VERSION"
+        }
+        "tag=$tag" >> $env:GITHUB_OUTPUT
+        Write-Host "Последний стабильный CyberpunkIdPrinter: $tag"
+
+    - name: Check out exactly that release tag
+      uses: actions/checkout@v4
+      with:
+        repository: limbura/CyberpunkIdPrinter
+        ref: ${{ steps.resolve.outputs.tag }}
+        path: CyberpunkIdPrinter
+        persist-credentials: false
+
+    - name: Verify source version and record immutable commit
+      id: verify
+      shell: pwsh
+      env:
+        PRINTER_TAG: ${{ steps.resolve.outputs.tag }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $path = 'CyberpunkIdPrinter/src/cyberwall_id_printer/__init__.py'
+        $source = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        $match = [regex]::Match($source, '(?m)^__version__\s*=\s*["''](?<version>[0-9]+\.[0-9]+\.[0-9]+)["'']')
+        if (-not $match.Success) { throw "В $path отсутствует строковая константа __version__" }
+        $version = $match.Groups['version'].Value
+        if ("v$version" -cne $env:PRINTER_TAG) {
+          throw "Версия исходников $version не совпадает с выбранным релизом $env:PRINTER_TAG"
+        }
+        $sha = git -C CyberpunkIdPrinter rev-parse HEAD
+        if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') {
+          throw 'Не удалось получить SHA скачанного релиза библиотеки принтера'
+        }
+        "version=$version" >> $env:GITHUB_OUTPUT
+        "sha=$sha" >> $env:GITHUB_OUTPUT
+        "### cyberwall_id_printer: $env:PRINTER_TAG" >> $env:GITHUB_STEP_SUMMARY
+        "Коммит: $sha" >> $env:GITHUB_STEP_SUMMARY
+        Write-Host "Проверена библиотека cyberwall_id_printer $version ($sha)"
