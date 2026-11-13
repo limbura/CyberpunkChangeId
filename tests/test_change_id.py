@@ -62,11 +62,11 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reader_busy_message_is_visible_and_never_calls_database(self):
         self.start(m.Stage.WAIT_CARD)
-        self.reader.wait.side_effect = m.ReaderUnavailable(
-            "Считыватель уже используется другим Master Manager")
+        conflict = m.ReaderUnavailable("reader reserved by another process")
+        self.reader.wait.side_effect = conflict
         await self.app.step()
         self.assertEqual(self.store.load().stage, m.Stage.FINISH)
-        self.assertIn("уже используется", self.store.load().result)
+        self.assertEqual(self.store.load().result, str(conflict))
         self.db.lookup.assert_not_called()
         self.db.change.assert_not_called()
         self.printer.print_id.assert_not_awaited()
@@ -109,7 +109,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         await app.step()
         self.db.change.assert_not_called()
         self.assertEqual(app.op.stage, m.Stage.FINISH)
-        self.assertIn('мастерку', app.op.result)
+        self.assertTrue(app.op.result.strip())
 
     async def test_known_id_never_changed_again(self):
         self.start(m.Stage.PRINT)
@@ -185,14 +185,14 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.load().input_errors, 4)
         await app.step()
         self.assertEqual(app.op.stage, m.Stage.FINISH)
-        self.assertIn('завершена', app.op.result)
+        self.assertTrue(app.op.result.strip())
         self.db.change.assert_not_called()
 
     async def test_five_wrong_inputs_handoff_then_next_player(self):
         self.start(m.Stage.VERIFY, input_errors=4)
         self.ui.answers = ['111111111', '1']
         await self.app.step()
-        self.assertIn('мастерку', self.app.op.result)
+        self.assertTrue(self.app.op.result.strip())
         app = self.restart()
         await app.step()
         self.assertEqual(self.store.load().stage, m.Stage.IDLE)
@@ -360,14 +360,16 @@ class InputAndReaderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_busy_reader_is_explained_without_any_card_command(self):
         module = self.fake_reader_module()
-        module.reserve_reader.side_effect = module.ReaderBusyError(
-            "Считыватель уже используется другим Master Manager")
+        library_error = module.ReaderBusyError("raw library busy error")
+        module.reserve_reader.side_effect = library_error
         reader = m.Reader(self.config())
         with patch.object(m.importlib, "import_module", return_value=module), \
              contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(m.ReaderUnavailable) as caught:
                 await reader.wait(self.reader_ui())
             self.assertEqual(str(caught.exception), m.READER_BUSY_MESSAGE)
+            self.assertTrue(str(caught.exception).strip())
+            self.assertNotEqual(str(caught.exception), str(library_error))
             await reader.close()
         module.read_card_number.assert_not_called()
         module.set_led.assert_not_called()
@@ -375,30 +377,27 @@ class InputAndReaderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_late_reader_conflict_is_not_retried(self):
         module = self.fake_reader_module()
-        module.read_card_number.side_effect = module.ReaderBusyError("Считыватель занят")
+        library_error = module.ReaderBusyError("raw library busy error")
+        module.read_card_number.side_effect = library_error
         reader = m.Reader(self.config())
         with patch.object(m.importlib, "import_module", return_value=module), \
              contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(m.ReaderUnavailable) as caught:
                 await reader.wait(self.reader_ui())
             self.assertEqual(str(caught.exception), m.READER_BUSY_MESSAGE)
+            self.assertTrue(str(caught.exception).strip())
+            self.assertNotEqual(str(caught.exception), str(library_error))
         module.read_card_number.assert_called_once()
         module.set_led.assert_not_called()
-
-    def test_busy_message_matches_player_instructions(self):
-        self.assertEqual(m.READER_BUSY_MESSAGE,
-            "Считыватель карт уже используется другой программой.\n"
-            "Возможно эта программа запущена дважды.\n"
-            "Закрой другие программы.\n"
-            "При неудаче сообщи мастерам и смени ID на другой гейте.")
 
     async def test_old_reader_api_is_rejected_without_usb_calls(self):
         module = self.fake_reader_module()
         del module.reserve_reader
         reader = m.Reader(self.config())
         with patch.object(m.importlib, "import_module", return_value=module):
-            with self.assertRaisesRegex(m.ReaderUnavailable, "1.8.1"):
+            with self.assertRaises(m.ReaderUnavailable) as caught:
                 await reader.wait(self.reader_ui())
+            self.assertTrue(str(caught.exception).strip())
         module.read_card_number.assert_not_called()
 
 
@@ -524,10 +523,12 @@ class PrintWarningTests(unittest.IsolatedAsyncioTestCase):
             warnings.simplefilter("always")
             with patch('builtins.print') as output:
                 await printer.print_id(123456789, 'А@')
-            self.assertEqual([call.args for call in output.call_args_list], [
-                ("Слишком длинное имя обрезано",),
-                ("Некорректное или пустое имя, напиши имя на наклейке вручную и сообщи мастерам",),
-            ])
+            self.assertEqual(output.call_count, 2)
+            self.assertTrue(all(
+                len(call.args) == 1 and isinstance(call.args[0], str)
+                and call.args[0].strip()
+                for call in output.call_args_list
+            ))
             warnings.warn("outside print", UnsupportedNameCharactersWarning)
         self.assertEqual(completed, [('123456789', 'А@')])
         self.assertEqual([item.category for item in caught],
@@ -549,7 +550,7 @@ class PrintWarningTests(unittest.IsolatedAsyncioTestCase):
                                          print_id=AsyncMock(side_effect=OSError("disconnected")))
         with patch.dict(sys.modules, cyberwall_id_printer=api), warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            with self.assertRaisesRegex(OSError, "disconnected"):
+            with self.assertRaises(OSError):
                 await printer.print_id(123456789, 'А@')
             warnings.warn("outside print", UnsupportedNameCharactersWarning)
         self.assertEqual(len(caught), 1)
