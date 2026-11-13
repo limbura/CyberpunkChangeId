@@ -365,8 +365,9 @@ class InputAndReaderTests(unittest.IsolatedAsyncioTestCase):
         reader = m.Reader(self.config())
         with patch.object(m.importlib, "import_module", return_value=module), \
              contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(m.ReaderUnavailable, "уже используется"):
+            with self.assertRaises(m.ReaderUnavailable) as caught:
                 await reader.wait(self.reader_ui())
+            self.assertEqual(str(caught.exception), m.READER_BUSY_MESSAGE)
             await reader.close()
         module.read_card_number.assert_not_called()
         module.set_led.assert_not_called()
@@ -378,10 +379,18 @@ class InputAndReaderTests(unittest.IsolatedAsyncioTestCase):
         reader = m.Reader(self.config())
         with patch.object(m.importlib, "import_module", return_value=module), \
              contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(m.ReaderUnavailable, "занят"):
+            with self.assertRaises(m.ReaderUnavailable) as caught:
                 await reader.wait(self.reader_ui())
+            self.assertEqual(str(caught.exception), m.READER_BUSY_MESSAGE)
         module.read_card_number.assert_called_once()
         module.set_led.assert_not_called()
+
+    def test_busy_message_matches_player_instructions(self):
+        self.assertEqual(m.READER_BUSY_MESSAGE,
+            "Считыватель карт уже используется другой программой.\n"
+            "Возможно эта программа запущена дважды.\n"
+            "Закрой другие программы.\n"
+            "При неудаче сообщи мастерам и смени ID на другой гейте.")
 
     async def test_old_reader_api_is_rejected_without_usb_calls(self):
         module = self.fake_reader_module()
