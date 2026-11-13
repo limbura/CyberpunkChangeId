@@ -1,0 +1,96 @@
+name: Release Windows ZIP
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: CyberpunkChangeId
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Check release tag against application version
+        working-directory: CyberpunkChangeId
+        run: |
+          python -c "import os,sys; from build_release import BASE,read_version; expected='v'+read_version(BASE/'change_id.py'); sys.exit(0 if os.environ['GITHUB_REF_NAME']==expected else 'Expected tag '+expected)"
+      - name: Get latest stable wcopy_reader release
+        id: reader_release
+        uses: ./CyberpunkChangeId/.github/actions/reader-release
+        with:
+          token: ${{ github.token }}
+          minimum-version: '1.8.1'
+      - name: Get latest stable cyberwall_id_printer release
+        id: printer_release
+        uses: ./CyberpunkChangeId/.github/actions/printer-release
+        with:
+          token: ${{ github.token }}
+          minimum-version: '1.3.0'
+      - name: Resolve TiMini-Print revision required by printer
+        id: timini_revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Get-Content -LiteralPath 'CyberpunkIdPrinter/src/cyberwall_id_printer/backends/timini.py' -Raw -Encoding UTF8
+          $match = [regex]::Match($source, '(?m)^TIMINI_REVISION\s*=\s*["''](?<sha>[0-9a-f]{40})["'']')
+          if (-not $match.Success) { throw 'Missing valid TIMINI_REVISION in selected printer release' }
+          $sha = $match.Groups['sha'].Value
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Selected printer requires TiMini-Print $sha"
+      - uses: actions/checkout@v4
+        with:
+          repository: Dejniel/TiMini-Print
+          ref: ${{ steps.timini_revision.outputs.sha }}
+          path: TiMini-Print
+          persist-credentials: false
+      - name: Run Change ID tests
+        working-directory: CyberpunkChangeId
+        run: python -m unittest discover -s tests -v
+      - name: Build and self-test Windows ZIP
+        working-directory: CyberpunkChangeId
+        run: python build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-zip
+          path: CyberpunkChangeId/bulds/change_id_${{ github.ref_name }}_windows_x64.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-zip
+      - uses: actions/checkout@v4
+        with:
+          path: CyberpunkChangeId
+          persist-credentials: false
+      - name: Get embedded library versions from release ZIP
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 CyberpunkChangeId/release_notes.py \
+            --archive "change_id_${RELEASE_TAG}_windows_x64.zip" \
+            --tag "$RELEASE_TAG" \
+            --output release-library-notes.md
+      - name: Publish ZIP on GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "change_id_${GITHUB_REF_NAME}_windows_x64.zip" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes "$(cat release-library-notes.md)" --generate-notes
