@@ -71,6 +71,12 @@ def build(config_path):
                      printer_project / "pyproject.toml", timini / "timiniprint" / "__init__.py"):
         if not required.is_file():
             raise FileNotFoundError(f"Required source missing: {required}")
+    reader_version = read_version(reader / "wcopy_reader.py")
+    if tuple(map(int, reader_version.split("."))) < (1, 8, 1):
+        raise RuntimeError(
+            "Для сборки нужен wcopy_reader 1.8.1+ с поддержкой wCopy/Cyb, "
+            "автоматической индикацией и блокировкой считывателя; "
+            f"найден {reader_version}. Обновите CyberpunkPcRfidReader.")
 
     # A fresh environment prevents accidental use of packages from the developer's venv.
     with tempfile.TemporaryDirectory(prefix="change-id-build-") as temporary:

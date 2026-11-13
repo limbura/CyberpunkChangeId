@@ -27,7 +27,7 @@ import warnings
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 
-__version__ = "1.0.2"
+__version__ = "1.0.4"
 
 BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 LOG = logging.getLogger("change_id")
@@ -146,7 +146,7 @@ class Store:
                     raise ValueError("missing confirmed ID")
             return op
         except (ValueError, TypeError, KeyError) as exc:
-            raise StateError("Повреждено сохранённое состояние. Сообщи мастеру; файл не удалён.") from exc
+            raise StateError("Повреждено сохранённое состояние смены ID. Сообщи мастеру.") from exc
 
     def save(self, op):
         try:
@@ -154,7 +154,7 @@ class Store:
                 self.db.execute("INSERT OR REPLACE INTO state VALUES (1, ?)",
                                 (json.dumps({"version": 1, **asdict(op)}, ensure_ascii=False),))
         except sqlite3.Error as exc:
-            raise StateError("Не удалось сохранить этап. Работа остановлена; сообщи мастеру.") from exc
+            raise StateError("Не удалось сохранить этап смены ID в файл. Работа остановлена, сообщи мастеру.") from exc
 
     def close(self):
         self.db.close()
@@ -270,7 +270,7 @@ class Console:
             if value.casefold() in (":b", ":q"):
                 if cancellable:
                     raise Cancel
-                print("Смена ID уже начата. Сначала заверши замену наклейки.")
+                print("Смена ID уже начата. Сначала необходимо завершить замену наклейки.")
                 continue
             if not value:  # Repeated Enter cannot advance the next screen.
                 continue
@@ -323,7 +323,7 @@ class Database:
             raise RuntimeError("Неправильный ответ БД после вызова процедуры changeId")
         number = int(row["new_id"])
         if not 100000000 <= number <= 999999999:
-            raise RuntimeError("БД вернула ID меньше 100000000 или больше 999999999")
+            raise RuntimeError("БД вернула ID некорректный ID: меньше 100000000 или больше 999999999")
         return number
 
 
@@ -331,18 +331,48 @@ class AccountMissing(Exception):
     pass
 
 
+READER_BUSY_MESSAGE = (
+    "Считыватель карт уже используется другой программой.\n"
+    "Возможно эта программа запущена дважды.\n"
+    "Закрой другие программы.\n"
+    "При неудаче сообщи мастерам и смени ID на другом гейте."
+)
+
+
+class ReaderUnavailable(RuntimeError):
+    """A reader problem which the player should see instead of a generic error."""
+
+
 class Reader:
     def __init__(self, config):
         self.config = config
+        self._module = None
 
     async def wait(self, ui):
         module = importlib.import_module("wcopy_reader")
+        self._module = module
+        # 1.8.1 handles both wCopy and Cyb, including feedback and process locks.
+        if not all(hasattr(module, name) for name in (
+                "reserve_reader", "close_readers", "set_persistent_host_control")):
+            raise ReaderUnavailable(
+                "Устаревшая библиотека считывателя. Нужна wcopy_reader 1.8.1 или новее. "
+                "Сообщи мастерам.")
+        await asyncio.to_thread(module.set_persistent_host_control, True)
         readers = await asyncio.to_thread(module.list_readers)
         if len(readers) != 1:
-            raise RuntimeError("Должен быть подключен только один считыватель RFID")
+            raise ReaderUnavailable(
+                "Считыватель карт не подключен или подключено несколько считывателей.\n"
+                "Попробуй переподключить USB считывателя и попытаться снова.\n"
+                "При неудаче сообщи мастерам и смени ID на другом гейте.")
         path = readers[0].path
+        try:
+            # Fail before USB commands if another Cyberpunk process owns this reader.
+            await asyncio.to_thread(module.reserve_reader, path=path)
+        except module.RFIDError as exc:
+            LOG.debug("RFID reservation failed", exc_info=True)
+            message = READER_BUSY_MESSAGE if exc.code == "READER_BUSY" else str(exc)
+            raise ReaderUnavailable(message) from exc
         errors = 0
-        feedback = True
         ui.drain()
         print("Приложи карту пользователя. Esc / Ctrl+C — отмена (в Linux: :b и Enter).")
         while True:
@@ -350,35 +380,36 @@ class Reader:
             if ui.cancel_requested or (c is not None and c.strip() in ("\x1b", "\x03", ":b", ":q")):
                 raise Cancel
             try:
-                number = await asyncio.to_thread(module.read_card_number, path=path,
-                                                timeout_ms=self.config["timeout_ms"])
-                present = True
+                number = await asyncio.to_thread(
+                    module.read_card_number, path=path,
+                    timeout_ms=self.config["timeout_ms"], auto_feedback=True)
             except module.NoCardError:
-                number, present = None, False
+                number = None
             except module.RFIDError as exc:
                 LOG.debug("RFID failure", exc_info=True)
-                if exc.code in {"READER_NOT_FOUND", "MULTIPLE_READERS", "READER_OPEN_ERROR",
-                                "USB_ERROR", "DEPENDENCY_ERROR"}:
-                    raise
+                if exc.code == "READER_BUSY":
+                    raise ReaderUnavailable(READER_BUSY_MESSAGE) from exc
+                if exc.code in {"READER_LOCK_ERROR", "READER_NOT_FOUND",
+                                "MULTIPLE_READERS", "READER_OPEN_ERROR", "USB_ERROR",
+                                "DEPENDENCY_ERROR"}:
+                    raise ReaderUnavailable(str(exc)) from exc
                 errors += 1
                 if errors >= self.config["attempts"]:
                     raise
                 print("Не удалось прочитать карту. Удерживай её на считывателе…")
                 await asyncio.sleep(0.5)
                 continue
-            if feedback:
-                try:
-                    await asyncio.to_thread(module.set_led, "green" if present else "red",
-                                            path=path, timeout_ms=self.config["timeout_ms"])
-                except module.RFIDError:
-                    LOG.debug("RFID feedback disabled", exc_info=True)
-                    feedback = False
+            # All LED/beep feedback is now inside read_card_number() for both devices.
             # A cancellation received during a blocking HID call wins before DB.
             if ui.cancel_requested:
                 raise Cancel
             if number is not None:
                 return number
             await asyncio.sleep(self.config["poll_interval"])
+
+    async def close(self):
+        if self._module is not None:
+            await asyncio.to_thread(self._module.close_readers)
 
 
 class Printer:
@@ -561,9 +592,12 @@ class App:
                 card = await self.reader.wait(self.ui)
             except Cancel:
                 raise
+            except ReaderUnavailable as exc:
+                LOG.debug("Reader unavailable", exc_info=True)
+                self.finish(str(exc))
             except Exception:
                 LOG.debug("Reader unavailable", exc_info=True)
-                self.finish("Не удалось прочитать карту или считыватель недоступен. Попробуй другой гейт; сообщи мастерам.")
+                self.finish("Не удалось прочитать карту или считыватель недоступен. Попробуй другой гейт, сообщи мастерам.")
             else:
                 if card == 0:
                     self.finish("Карта не записана (пустая, card_id=0). Отправь владельца карты на мастерку.")
@@ -575,7 +609,7 @@ class App:
                 row = await asyncio.to_thread(self.db.lookup, self.op.card_id)
             except Exception:
                 LOG.debug("Lookup failed", exc_info=True)
-                await self.ui.acknowledge("Нет связи с сервером. ID не менялся. Сообщи мастерам, попробуй на другом гейте.", cancellable=True)
+                await self.ui.acknowledge("Нет связи с БД. ID не менялся. Сообщи мастерам, попробуй на другом гейте.", cancellable=True)
                 self.reset()
             else:
                 if not row:
@@ -584,8 +618,8 @@ class App:
                     self.go(Stage.CONFIRM, name=safe_name(row["name"]), old_id=int(row["id"]))
         elif s == Stage.CONFIRM:
             choice = await self.ui.ask(
-                "Сейчас ID будет изменён. После этого обязательно замени наклейку.\n"
-                "Если закончить не получится — отправь владельца карты на мастерку.\n"
+                "Сейчас ID будет изменён. После подтверждения нужно будет обязательно завершить замену наклейки.\n"
+                "Если по каким-либо причинам это не удастся — отправь владельца карты на мастерку.\n"
                 "1 — начать смену ID\n2 — отмена", choices={"1", "2"}, cancellable=True)
             if choice == "2":
                 self.reset()
@@ -594,7 +628,7 @@ class App:
         elif s == Stage.CHANGE:
             self.db.ensure_password()
             if self.op.db_attempts >= self.config["database"]["attempts"]:
-                self.finish("Не удалось подтвердить смену ID. ID мог измениться. Отправь владельца карты на мастерку.")
+                self.finish("Не удалось получить новый ID от БД. ID мог измениться, а мог и не измениться. Отправь владельца карты на мастерку.")
                 return True
             self.go(Stage.CHANGE, db_attempts=self.op.db_attempts + 1)
             print("Меняю ID…", flush=True)
@@ -604,13 +638,13 @@ class App:
                 self.finish("Аккаунт не найден в БД. Отправь владельца карты на мастерку.")
             except Exception:
                 LOG.debug("changeId result unconfirmed", exc_info=True)
-                print("Результат не подтверждён. Повторяю подключение и смену ID…")
+                print("Неправильный ответ от БД. Повторяю подключение и смену ID…")
                 await asyncio.sleep(0.5)
             else:
                 self.go(Stage.PRINT, new_id=number)
         elif s == Stage.PRINT:
             try:
-                print("Проверяю подключение к термопринтеру…", flush=True)
+                print("Подключение к термопринтеру… подожди…", flush=True)
                 await self.printer.connect()
             except Exception:
                 LOG.debug("Printer connection failed", exc_info=True)
@@ -628,7 +662,7 @@ class App:
         elif s == Stage.LABEL:
             print(self.op.notice)
             choice = await self.ui.ask(
-                "Наклейка напечаталась? Ты наклеил её на карту ВЗАМЕН старой?\n"
+                "Не отрывай пустую ленту. Наклейка напечаталась? Ты наклеил её на карту ВЗАМЕН старой?\n"
                 "1 — да, заменил\n2 — нет, попробовать напечатать ещё раз\n"
                 "3 — нет, заполнить вручную", choices={"1", "2", "3"})
             if choice == "1":
@@ -637,21 +671,21 @@ class App:
             elif choice == "2":
                 self.go(Stage.REMOVE)
             else:
-                self.go(Stage.MANUAL, notice="Не удалось напечатать наклейку")
+                self.go(Stage.MANUAL, notice="Не удалось напечатать наклейку. Не отрывай пустую ленту.")
         elif s == Stage.RETRY:
             if self.op.notice:
                 print(self.op.notice)
             choice = await self.ui.ask("1 — попробовать печать ещё раз\n2 — заполнить вручную", choices={"1", "2"})
             self.go(Stage.REMOVE if choice == "1" else Stage.MANUAL)
         elif s == Stage.REMOVE:
-            await self.ui.acknowledge("Отклей от вышедшей ленты все доступные наклейки и выброси их.")
+            await self.ui.acknowledge("Не отрывая ленту, отклей от нее все доступные наклейки и выброси их.")
             self.printer.removed = True
             self.go(Stage.PRINT)
         elif s == Stage.MANUAL:
             print(self.op.notice + ". После смены ID сообщи об этом мастерам.")
             await self.ui.acknowledge(
                 "Возьми пустой шаблон и маркер. Наклей шаблон ВЗАМЕН старой наклейки.\n"
-                "Напиши имя и ID: " + formatted_id(self.op.new_id) + "\nНажми 1, когда закончишь.")
+                "Напиши имя и ID: " + formatted_id(self.op.new_id) + "\nВведи 1, когда закончишь.")
             self.go(Stage.VERIFY)
         elif s == Stage.VERIFY:
             value = await self.ui.ask("Введи ID, который ты написал на наклейке:")
@@ -778,13 +812,21 @@ def setup_logging(enabled):
 async def run(config):
     store = Store(BASE / "change_id_state.sqlite3")
     printer = Printer(config["printer"])
+    reader = Reader(config["reader"])
     try:
-        app = App(config, store, Console(), Database(config["database"]), Reader(config["reader"]), printer)
+        app = App(config, store, Console(), Database(config["database"]), reader, printer)
         printer.start()
         await app.run()
     finally:
-        await printer.close()
-        store.close()
+        try:
+            # Cyb must leave PC-host mode on normal exit; release the shared
+            # process lock too. Never replace a pending workflow checkpoint.
+            await reader.close()
+        finally:
+            try:
+                await printer.close()
+            finally:
+                store.close()
 
 
 def release_self_test(config_path):
@@ -792,6 +834,9 @@ def release_self_test(config_path):
     load_config(config_path)
     import hid
     import wcopy_reader
+    for method in ("reserve_reader", "close_readers", "set_persistent_host_control"):
+        if not hasattr(wcopy_reader, method):
+            raise RuntimeError("Bundled wcopy_reader lacks 1.8.1 reader API: " + method)
     import pymysql
     import cryptography.hazmat.primitives.asymmetric.rsa
     import bleak.backends.winrt.client
@@ -839,7 +884,7 @@ def main():
         return 1
     except Exception:
         LOG.debug("Fatal failure", exc_info=True)
-        print("Работа остановлена. Если смена ID была начата, отправь владельца карты на мастерку.")
+        print("Фатальная ошибка, перезапусти программу. Если смена ID была начата, отправь владельца карты на мастерку.")
         return 1
 
 
