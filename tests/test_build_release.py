@@ -24,11 +24,12 @@ class ReleaseTests(unittest.TestCase):
             bundle.mkdir()
             (bundle / 'change_id.exe').write_bytes(b'exe')
             (bundle / 'config.toml').write_text('[database]\n')
+            (bundle / 'BUILD_INFO.json').write_text('{"version":"1.2.3"}')
             target = root / 'bulds' / 'release.zip'
             b.publish_zip(bundle, target)
             original = target.read_bytes()
             with zipfile.ZipFile(target) as archive:
-                self.assertEqual(set(archive.namelist()), {'change_id.exe', 'config.toml'})
+                self.assertEqual(set(archive.namelist()), {'change_id.exe', 'config.toml', 'BUILD_INFO.json'})
             with patch.object(zipfile.ZipFile, 'write', side_effect=OSError('disk full')):
                 with self.assertRaises(OSError):
                     b.publish_zip(bundle, target)
@@ -38,6 +39,12 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 b.publish_zip(bundle, root / 'new.zip')
             self.assertFalse((root / 'new.zip').exists())
+
+            (bundle / 'config.toml').write_text('[database]\n')
+            (bundle / 'BUILD_INFO.json').unlink()
+            with self.assertRaises(RuntimeError):
+                b.publish_zip(bundle, root / 'no-metadata.zip')
+            self.assertFalse((root / 'no-metadata.zip').exists())
 
     def test_build_failure_exit_code(self):
         with patch.object(b, 'build', side_effect=RuntimeError('failed')):
