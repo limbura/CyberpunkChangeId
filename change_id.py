@@ -27,7 +27,7 @@ import warnings
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 LOG = logging.getLogger("change_id")
@@ -331,18 +331,38 @@ class AccountMissing(Exception):
     pass
 
 
+class ReaderUnavailable(RuntimeError):
+    """A reader problem which the player should see instead of a generic error."""
+
+
 class Reader:
     def __init__(self, config):
         self.config = config
+        self._module = None
 
     async def wait(self, ui):
         module = importlib.import_module("wcopy_reader")
+        self._module = module
+        # 1.8.1 handles both wCopy and Cyb, including feedback and process locks.
+        if not all(hasattr(module, name) for name in (
+                "reserve_reader", "close_readers", "set_persistent_host_control")):
+            raise ReaderUnavailable(
+                "Устаревшая библиотека считывателя. Нужна wcopy_reader 1.8.1 или новее. "
+                "Сообщи мастерам.")
+        await asyncio.to_thread(module.set_persistent_host_control, True)
         readers = await asyncio.to_thread(module.list_readers)
         if len(readers) != 1:
-            raise RuntimeError("Должен быть подключен только один считыватель RFID")
+            raise ReaderUnavailable(
+                "Подключи ровно один считыватель wCopy или Cyb. "
+                "Если их несколько, отключи лишние.")
         path = readers[0].path
+        try:
+            # Fail before USB commands if another Cyberpunk process owns this reader.
+            await asyncio.to_thread(module.reserve_reader, path=path)
+        except module.RFIDError as exc:
+            LOG.debug("RFID reservation failed", exc_info=True)
+            raise ReaderUnavailable(str(exc)) from exc
         errors = 0
-        feedback = True
         ui.drain()
         print("Приложи карту пользователя. Esc / Ctrl+C — отмена (в Linux: :b и Enter).")
         while True:
@@ -350,35 +370,34 @@ class Reader:
             if ui.cancel_requested or (c is not None and c.strip() in ("\x1b", "\x03", ":b", ":q")):
                 raise Cancel
             try:
-                number = await asyncio.to_thread(module.read_card_number, path=path,
-                                                timeout_ms=self.config["timeout_ms"])
-                present = True
+                number = await asyncio.to_thread(
+                    module.read_card_number, path=path,
+                    timeout_ms=self.config["timeout_ms"], auto_feedback=True)
             except module.NoCardError:
-                number, present = None, False
+                number = None
             except module.RFIDError as exc:
                 LOG.debug("RFID failure", exc_info=True)
-                if exc.code in {"READER_NOT_FOUND", "MULTIPLE_READERS", "READER_OPEN_ERROR",
-                                "USB_ERROR", "DEPENDENCY_ERROR"}:
-                    raise
+                if exc.code in {"READER_BUSY", "READER_LOCK_ERROR", "READER_NOT_FOUND",
+                                "MULTIPLE_READERS", "READER_OPEN_ERROR", "USB_ERROR",
+                                "DEPENDENCY_ERROR"}:
+                    raise ReaderUnavailable(str(exc)) from exc
                 errors += 1
                 if errors >= self.config["attempts"]:
                     raise
                 print("Не удалось прочитать карту. Удерживай её на считывателе…")
                 await asyncio.sleep(0.5)
                 continue
-            if feedback:
-                try:
-                    await asyncio.to_thread(module.set_led, "green" if present else "red",
-                                            path=path, timeout_ms=self.config["timeout_ms"])
-                except module.RFIDError:
-                    LOG.debug("RFID feedback disabled", exc_info=True)
-                    feedback = False
+            # All LED/beep feedback is now inside read_card_number() for both devices.
             # A cancellation received during a blocking HID call wins before DB.
             if ui.cancel_requested:
                 raise Cancel
             if number is not None:
                 return number
             await asyncio.sleep(self.config["poll_interval"])
+
+    async def close(self):
+        if self._module is not None:
+            await asyncio.to_thread(self._module.close_readers)
 
 
 class Printer:
@@ -561,6 +580,9 @@ class App:
                 card = await self.reader.wait(self.ui)
             except Cancel:
                 raise
+            except ReaderUnavailable as exc:
+                LOG.debug("Reader unavailable", exc_info=True)
+                self.finish(str(exc))
             except Exception:
                 LOG.debug("Reader unavailable", exc_info=True)
                 self.finish("Не удалось прочитать карту или считыватель недоступен. Попробуй другой гейт; сообщи мастерам.")
@@ -778,13 +800,21 @@ def setup_logging(enabled):
 async def run(config):
     store = Store(BASE / "change_id_state.sqlite3")
     printer = Printer(config["printer"])
+    reader = Reader(config["reader"])
     try:
-        app = App(config, store, Console(), Database(config["database"]), Reader(config["reader"]), printer)
+        app = App(config, store, Console(), Database(config["database"]), reader, printer)
         printer.start()
         await app.run()
     finally:
-        await printer.close()
-        store.close()
+        try:
+            # Cyb must leave PC-host mode on normal exit; release the shared
+            # process lock too. Never replace a pending workflow checkpoint.
+            await reader.close()
+        finally:
+            try:
+                await printer.close()
+            finally:
+                store.close()
 
 
 def release_self_test(config_path):
@@ -792,6 +822,9 @@ def release_self_test(config_path):
     load_config(config_path)
     import hid
     import wcopy_reader
+    for method in ("reserve_reader", "close_readers", "set_persistent_host_control"):
+        if not hasattr(wcopy_reader, method):
+            raise RuntimeError("Bundled wcopy_reader lacks 1.8.1 reader API: " + method)
     import pymysql
     import cryptography.hazmat.primitives.asymmetric.rsa
     import bleak.backends.winrt.client
