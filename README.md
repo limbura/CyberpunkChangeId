@@ -201,8 +201,8 @@ python build_release.py
 python build_release.py --config change_id.local.toml
 ```
 
-Версия задаётся только в `change_id.py`: `__version__ = "1.0.3"`.
-Результат: `bulds/change_id_v1.0.3_windows_x64.zip` (имя папки — именно `bulds`).
+Версия задаётся только в `change_id.py`: `__version__ = "1.0.4"`.
+Результат: `bulds/change_id_v1.0.4_windows_x64.zip` (имя папки — именно `bulds`).
 Сборщик проверяет версию исходной библиотеки считывателя и откажется собирать EXE с `wcopy_reader` старше `1.8.1`.
 В корне архива находятся `change_id.exe`, `config.toml` и каталог `_internal`
 с Python, библиотеками, DLL и данными принтера. Конфиг копируется из выбранного
