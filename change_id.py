@@ -27,7 +27,7 @@ import warnings
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 LOG = logging.getLogger("change_id")
@@ -331,6 +331,14 @@ class AccountMissing(Exception):
     pass
 
 
+READER_BUSY_MESSAGE = (
+    "Считыватель карт уже используется другой программой.\n"
+    "Возможно эта программа запущена дважды.\n"
+    "Закрой другие программы.\n"
+    "При неудаче сообщи мастерам и смени ID на другой гейте."
+)
+
+
 class ReaderUnavailable(RuntimeError):
     """A reader problem which the player should see instead of a generic error."""
 
@@ -362,7 +370,8 @@ class Reader:
             await asyncio.to_thread(module.reserve_reader, path=path)
         except module.RFIDError as exc:
             LOG.debug("RFID reservation failed", exc_info=True)
-            raise ReaderUnavailable(str(exc)) from exc
+            message = READER_BUSY_MESSAGE if exc.code == "READER_BUSY" else str(exc)
+            raise ReaderUnavailable(message) from exc
         errors = 0
         ui.drain()
         print("Приложи карту пользователя. Esc / Ctrl+C — отмена (в Linux: :b и Enter).")
@@ -378,7 +387,9 @@ class Reader:
                 number = None
             except module.RFIDError as exc:
                 LOG.debug("RFID failure", exc_info=True)
-                if exc.code in {"READER_BUSY", "READER_LOCK_ERROR", "READER_NOT_FOUND",
+                if exc.code == "READER_BUSY":
+                    raise ReaderUnavailable(READER_BUSY_MESSAGE) from exc
+                if exc.code in {"READER_LOCK_ERROR", "READER_NOT_FOUND",
                                 "MULTIPLE_READERS", "READER_OPEN_ERROR", "USB_ERROR",
                                 "DEPENDENCY_ERROR"}:
                     raise ReaderUnavailable(str(exc)) from exc
