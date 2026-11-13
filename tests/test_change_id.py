@@ -60,6 +60,17 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     def restart(self):
         return m.App(self.config, self.store, self.ui, self.db, self.reader, self.printer)
 
+    async def test_reader_busy_message_is_visible_and_never_calls_database(self):
+        self.start(m.Stage.WAIT_CARD)
+        self.reader.wait.side_effect = m.ReaderUnavailable(
+            "Считыватель уже используется другим Master Manager")
+        await self.app.step()
+        self.assertEqual(self.store.load().stage, m.Stage.FINISH)
+        self.assertIn("уже используется", self.store.load().result)
+        self.db.lookup.assert_not_called()
+        self.db.change.assert_not_called()
+        self.printer.print_id.assert_not_awaited()
+
     async def test_full_automatic_flow(self):
         self.ui.answers = ['1', '1', '1', '1']
         for _ in range(8):
@@ -305,23 +316,81 @@ class InputAndReaderTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(ui, 'drain'), patch.object(ui, 'poll', side_effect=[':q\n', '1\n']), patch.object(m.os, 'name', 'posix'), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(await ui.ask('Choose', choices={'1'}), '1')
 
-    async def test_no_card_does_not_use_error_budget(self):
+    def fake_reader_module(self, backend="cyb"):
         class RFIDError(Exception):
-            pass
+            code = "RFID_ERROR"
         class NoCardError(RFIDError):
-            pass
+            code = "NO_CARD"
+        class ReaderBusyError(RFIDError):
+            code = "READER_BUSY"
         module = Mock()
         module.RFIDError, module.NoCardError = RFIDError, NoCardError
-        module.list_readers.return_value = [Mock(path=b'reader')]
-        module.read_card_number.side_effect = [NoCardError(), NoCardError(), 42]
-        module.set_led.side_effect = RFIDError()
+        module.ReaderBusyError = ReaderBusyError
+        module.list_readers.return_value = [Mock(path=b"reader", backend=backend)]
+        return module
+
+    def reader_ui(self):
         ui = Mock(cancel_requested=False)
         ui.poll.return_value = None
-        reader = m.Reader({'timeout_ms': 750, 'attempts': 1, 'poll_interval': 0.001})
-        with patch.object(m.importlib, 'import_module', return_value=module), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(await reader.wait(ui), 42)
-        self.assertEqual(module.read_card_number.call_count, 3)
-        self.assertEqual(module.set_led.call_count, 1)
+        return ui
+
+    def config(self):
+        return {"timeout_ms": 750, "attempts": 1, "poll_interval": 0.001}
+
+    async def test_no_card_does_not_use_error_budget(self):
+        for backend in ("wcopy", "cyb"):
+            with self.subTest(backend=backend):
+                module = self.fake_reader_module(backend)
+                module.read_card_number.side_effect = [
+                    module.NoCardError(), module.NoCardError(), 42]
+                reader = m.Reader(self.config())
+                with patch.object(m.importlib, "import_module", return_value=module), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(await reader.wait(self.reader_ui()), 42)
+                    await reader.close()
+                module.set_persistent_host_control.assert_called_once_with(True)
+                module.reserve_reader.assert_called_once_with(path=b"reader")
+                self.assertEqual(module.read_card_number.call_count, 3)
+                for call in module.read_card_number.call_args_list:
+                    self.assertEqual(call.kwargs, dict(
+                        path=b"reader", timeout_ms=750, auto_feedback=True))
+                module.set_led.assert_not_called()
+                module.beep.assert_not_called()
+                module.close_readers.assert_called_once_with()
+
+    async def test_busy_reader_is_explained_without_any_card_command(self):
+        module = self.fake_reader_module()
+        module.reserve_reader.side_effect = module.ReaderBusyError(
+            "Считыватель уже используется другим Master Manager")
+        reader = m.Reader(self.config())
+        with patch.object(m.importlib, "import_module", return_value=module), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(m.ReaderUnavailable, "уже используется"):
+                await reader.wait(self.reader_ui())
+            await reader.close()
+        module.read_card_number.assert_not_called()
+        module.set_led.assert_not_called()
+        module.close_readers.assert_called_once_with()
+
+    async def test_late_reader_conflict_is_not_retried(self):
+        module = self.fake_reader_module()
+        module.read_card_number.side_effect = module.ReaderBusyError("Считыватель занят")
+        reader = m.Reader(self.config())
+        with patch.object(m.importlib, "import_module", return_value=module), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(m.ReaderUnavailable, "занят"):
+                await reader.wait(self.reader_ui())
+        module.read_card_number.assert_called_once()
+        module.set_led.assert_not_called()
+
+    async def test_old_reader_api_is_rejected_without_usb_calls(self):
+        module = self.fake_reader_module()
+        del module.reserve_reader
+        reader = m.Reader(self.config())
+        with patch.object(m.importlib, "import_module", return_value=module):
+            with self.assertRaisesRegex(m.ReaderUnavailable, "1.8.1"):
+                await reader.wait(self.reader_ui())
+        module.read_card_number.assert_not_called()
 
 
 if __name__ == '__main__':
