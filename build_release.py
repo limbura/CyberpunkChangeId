@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import os
 from pathlib import Path
 import platform
@@ -30,7 +31,7 @@ def read_version(path):
             if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version):
                 return version
             break
-    raise ValueError("change_id.py must define __version__ = 'x.y.z'")
+    raise ValueError(f"{path} must define __version__ = 'x.y.z'")
 
 
 def run(command, **kwargs):
@@ -49,7 +50,7 @@ def publish_zip(bundle, target):
         with zipfile.ZipFile(pending) as archive:
             if archive.testzip() is not None:
                 raise RuntimeError("ZIP integrity check failed")
-            if not {"change_id.exe", "config.toml"} <= set(archive.namelist()):
+            if not {"change_id.exe", "config.toml", "BUILD_INFO.json"} <= set(archive.namelist()):
                 raise RuntimeError("Release is incomplete")
         os.replace(pending, target)
 
@@ -72,6 +73,7 @@ def build(config_path):
         if not required.is_file():
             raise FileNotFoundError(f"Required source missing: {required}")
     reader_version = read_version(reader / "wcopy_reader.py")
+    printer_version = read_version(printer_src / "cyberwall_id_printer" / "__init__.py")
     if tuple(map(int, reader_version.split("."))) < (1, 8, 1):
         raise RuntimeError(
             "Для сборки нужен wcopy_reader 1.8.1+ с поддержкой wCopy/Cyb, "
@@ -86,6 +88,11 @@ def build(config_path):
         run([python, "-m", "pip", "install", "PyInstaller>=6,<7", "PyMySQL>=1.1,<2",
              "cryptography>=42", "hidapi>=0.14,<1", str(printer_project) + "[printer]"])
         run([python, "-m", "pip", "check"])
+        run([python, "-c", (
+            "import sys, cyberwall_id_printer; "
+            "assert cyberwall_id_printer.__version__ == sys.argv[1], "
+            "'Installed printer library does not match selected source release'"
+        ), printer_version])
         manifest = work / "cyberwall_timini.json"
         # Use the installed printer library's own revision/cleanliness validation.
         run([python, "-c", (
@@ -94,6 +101,7 @@ def build(config_path):
             "load_timini(sys.argv[1]); "
             "Path(sys.argv[2]).write_text(json.dumps({'revision':TIMINI_REVISION}),encoding='utf-8')"
         ), timini, manifest])
+        timini_revision = json.loads(manifest.read_text(encoding="utf-8"))["revision"]
         spec = work / "change_id.spec"
         spec.write_text(f'''
 from PyInstaller.utils.hooks import collect_all
@@ -120,6 +128,16 @@ coll = COLLECT(exe, a.binaries, a.datas, name='change_id', upx=False)
              "--distpath", work / "dist", "--workpath", work / "work", spec], env=env)
         bundle = work / "dist" / "change_id"
         shutil.copyfile(config_path, bundle / "config.toml")
+        build_info = {
+            "application": "change_id",
+            "version": version,
+            "reader_version": reader_version,
+            "printer_version": printer_version,
+            "timini_revision": timini_revision,
+        }
+        (bundle / "BUILD_INFO.json").write_text(
+            json.dumps(build_info, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
         exe = bundle / "change_id.exe"
         if not exe.is_file() or not (bundle / "_internal").is_dir():
             raise RuntimeError("PyInstaller did not produce a complete application")
