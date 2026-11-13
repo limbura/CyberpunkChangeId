@@ -1,0 +1,77 @@
+name: Checkout latest stable wcopy_reader release
+description: Resolve the latest published non-prerelease GitHub Release and check out its exact tag
+inputs:
+  token:
+    description: GitHub token with permission to read public release metadata
+    required: true
+  minimum-version:
+    description: Minimum wcopy_reader version accepted by Change ID
+    required: false
+    default: "1.8.1"
+outputs:
+  tag:
+    description: Stable GitHub Release tag actually selected
+    value: ${{ steps.resolve.outputs.tag }}
+  version:
+    description: Validated source library version
+    value: ${{ steps.verify.outputs.version }}
+  sha:
+    description: Exact reader repository commit used in the build
+    value: ${{ steps.verify.outputs.sha }}
+runs:
+  using: composite
+  steps:
+    - name: Find latest published stable reader release
+      id: resolve
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        MINIMUM_VERSION: ${{ inputs.minimum-version }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # /releases/latest deliberately ignores drafts and prereleases.
+        $json = gh api repos/limbura/CyberpunkPcRfidReader/releases/latest
+        if ($LASTEXITCODE -ne 0) { throw 'Не удалось получить последний стабильный релиз wcopy_reader' }
+        $release = $json | ConvertFrom-Json
+        $tag = [string]$release.tag_name
+        if ($release.draft -or $release.prerelease -or $tag -cnotmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+          throw "Последний GitHub Release имеет неподдерживаемую метку или не является стабильным: $tag"
+        }
+        if ([version]$tag.Substring(1) -lt [version]$env:MINIMUM_VERSION) {
+          throw "Последний стабильный релиз $tag старее минимальной совместимой версии $env:MINIMUM_VERSION"
+        }
+        "tag=$tag" >> $env:GITHUB_OUTPUT
+        Write-Host "Последний стабильный CyberpunkPcRfidReader: $tag"
+
+    - name: Check out exactly that release tag
+      uses: actions/checkout@v4
+      with:
+        repository: limbura/CyberpunkPcRfidReader
+        ref: ${{ steps.resolve.outputs.tag }}
+        path: CyberpunkPcRfidReader
+        persist-credentials: false
+
+    - name: Verify source version and record immutable commit
+      id: verify
+      shell: pwsh
+      env:
+        READER_TAG: ${{ steps.resolve.outputs.tag }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $path = 'CyberpunkPcRfidReader/wcopy_reader_package/wcopy_reader.py'
+        $source = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        $match = [regex]::Match($source, '(?m)^__version__\s*=\s*["''](?<version>[0-9]+\.[0-9]+\.[0-9]+)["'']')
+        if (-not $match.Success) { throw "В $path отсутствует строковая константа __version__" }
+        $version = $match.Groups['version'].Value
+        if ("v$version" -cne $env:READER_TAG) {
+          throw "Версия исходников $version не совпала с выбранным релизом $env:READER_TAG"
+        }
+        $sha = git -C CyberpunkPcRfidReader rev-parse HEAD
+        if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') {
+          throw 'Не удалось получить SHA скачанного релиза считывателя'
+        }
+        "version=$version" >> $env:GITHUB_OUTPUT
+        "sha=$sha" >> $env:GITHUB_OUTPUT
+        "### wcopy_reader: $env:READER_TAG" >> $env:GITHUB_STEP_SUMMARY
+        "Коммит: $sha" >> $env:GITHUB_STEP_SUMMARY
+        Write-Host "Проверена библиотека wcopy_reader $version ($sha)"
