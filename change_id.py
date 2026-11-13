@@ -146,7 +146,7 @@ class Store:
                     raise ValueError("missing confirmed ID")
             return op
         except (ValueError, TypeError, KeyError) as exc:
-            raise StateError("Повреждено сохранённое состояние. Сообщи мастеру; файл не удалён.") from exc
+            raise StateError("Повреждено сохранённое состояние смены ID. Сообщи мастеру.") from exc
 
     def save(self, op):
         try:
@@ -154,7 +154,7 @@ class Store:
                 self.db.execute("INSERT OR REPLACE INTO state VALUES (1, ?)",
                                 (json.dumps({"version": 1, **asdict(op)}, ensure_ascii=False),))
         except sqlite3.Error as exc:
-            raise StateError("Не удалось сохранить этап. Работа остановлена; сообщи мастеру.") from exc
+            raise StateError("Не удалось сохранить этап смены ID в файл. Работа остановлена, сообщи мастеру.") from exc
 
     def close(self):
         self.db.close()
@@ -270,7 +270,7 @@ class Console:
             if value.casefold() in (":b", ":q"):
                 if cancellable:
                     raise Cancel
-                print("Смена ID уже начата. Сначала заверши замену наклейки.")
+                print("Смена ID уже начата. Сначала необходимо завершить замену наклейки.")
                 continue
             if not value:  # Repeated Enter cannot advance the next screen.
                 continue
@@ -323,7 +323,7 @@ class Database:
             raise RuntimeError("Неправильный ответ БД после вызова процедуры changeId")
         number = int(row["new_id"])
         if not 100000000 <= number <= 999999999:
-            raise RuntimeError("БД вернула ID меньше 100000000 или больше 999999999")
+            raise RuntimeError("БД вернула ID некорректный ID: меньше 100000000 или больше 999999999")
         return number
 
 
@@ -353,8 +353,9 @@ class Reader:
         readers = await asyncio.to_thread(module.list_readers)
         if len(readers) != 1:
             raise ReaderUnavailable(
-                "Подключи ровно один считыватель wCopy или Cyb. "
-                "Если их несколько, отключи лишние.")
+                "Считыватель карт не подключен или подключено несколько считывателей.\n"
+                "Попробуй переподключить USB считывателя и попытаться снова.\n"
+                "При неудаче сообщи мастерам и смени ID на другой гейте.")
         path = readers[0].path
         try:
             # Fail before USB commands if another Cyberpunk process owns this reader.
@@ -585,7 +586,7 @@ class App:
                 self.finish(str(exc))
             except Exception:
                 LOG.debug("Reader unavailable", exc_info=True)
-                self.finish("Не удалось прочитать карту или считыватель недоступен. Попробуй другой гейт; сообщи мастерам.")
+                self.finish("Не удалось прочитать карту или считыватель недоступен. Попробуй другой гейт, сообщи мастерам.")
             else:
                 if card == 0:
                     self.finish("Карта не записана (пустая, card_id=0). Отправь владельца карты на мастерку.")
@@ -597,7 +598,7 @@ class App:
                 row = await asyncio.to_thread(self.db.lookup, self.op.card_id)
             except Exception:
                 LOG.debug("Lookup failed", exc_info=True)
-                await self.ui.acknowledge("Нет связи с сервером. ID не менялся. Сообщи мастерам, попробуй на другом гейте.", cancellable=True)
+                await self.ui.acknowledge("Нет связи с БД. ID не менялся. Сообщи мастерам, попробуй на другом гейте.", cancellable=True)
                 self.reset()
             else:
                 if not row:
@@ -606,8 +607,8 @@ class App:
                     self.go(Stage.CONFIRM, name=safe_name(row["name"]), old_id=int(row["id"]))
         elif s == Stage.CONFIRM:
             choice = await self.ui.ask(
-                "Сейчас ID будет изменён. После этого обязательно замени наклейку.\n"
-                "Если закончить не получится — отправь владельца карты на мастерку.\n"
+                "Сейчас ID будет изменён. После подтверждения нужно будет обязательно завершить замену наклейки.\n"
+                "Если по каким-либо причинам это не удастся — отправь владельца карты на мастерку.\n"
                 "1 — начать смену ID\n2 — отмена", choices={"1", "2"}, cancellable=True)
             if choice == "2":
                 self.reset()
@@ -616,7 +617,7 @@ class App:
         elif s == Stage.CHANGE:
             self.db.ensure_password()
             if self.op.db_attempts >= self.config["database"]["attempts"]:
-                self.finish("Не удалось подтвердить смену ID. ID мог измениться. Отправь владельца карты на мастерку.")
+                self.finish("Не удалось получить новый ID от БД. ID мог измениться, а мог и не измениться. Отправь владельца карты на мастерку.")
                 return True
             self.go(Stage.CHANGE, db_attempts=self.op.db_attempts + 1)
             print("Меняю ID…", flush=True)
@@ -626,13 +627,13 @@ class App:
                 self.finish("Аккаунт не найден в БД. Отправь владельца карты на мастерку.")
             except Exception:
                 LOG.debug("changeId result unconfirmed", exc_info=True)
-                print("Результат не подтверждён. Повторяю подключение и смену ID…")
+                print("Неправильный ответ от БД. Повторяю подключение и смену ID…")
                 await asyncio.sleep(0.5)
             else:
                 self.go(Stage.PRINT, new_id=number)
         elif s == Stage.PRINT:
             try:
-                print("Проверяю подключение к термопринтеру…", flush=True)
+                print("Подключение к термопринтеру… подожди…", flush=True)
                 await self.printer.connect()
             except Exception:
                 LOG.debug("Printer connection failed", exc_info=True)
@@ -650,7 +651,7 @@ class App:
         elif s == Stage.LABEL:
             print(self.op.notice)
             choice = await self.ui.ask(
-                "Наклейка напечаталась? Ты наклеил её на карту ВЗАМЕН старой?\n"
+                "Не отрывай пустую ленту. Наклейка напечаталась? Ты наклеил её на карту ВЗАМЕН старой?\n"
                 "1 — да, заменил\n2 — нет, попробовать напечатать ещё раз\n"
                 "3 — нет, заполнить вручную", choices={"1", "2", "3"})
             if choice == "1":
@@ -659,21 +660,21 @@ class App:
             elif choice == "2":
                 self.go(Stage.REMOVE)
             else:
-                self.go(Stage.MANUAL, notice="Не удалось напечатать наклейку")
+                self.go(Stage.MANUAL, notice="Не удалось напечатать наклейку. Не отрывай пустую ленту.")
         elif s == Stage.RETRY:
             if self.op.notice:
                 print(self.op.notice)
             choice = await self.ui.ask("1 — попробовать печать ещё раз\n2 — заполнить вручную", choices={"1", "2"})
             self.go(Stage.REMOVE if choice == "1" else Stage.MANUAL)
         elif s == Stage.REMOVE:
-            await self.ui.acknowledge("Отклей от вышедшей ленты все доступные наклейки и выброси их.")
+            await self.ui.acknowledge("Не отрывая ленту, отклей от нее все доступные наклейки и выброси их.")
             self.printer.removed = True
             self.go(Stage.PRINT)
         elif s == Stage.MANUAL:
             print(self.op.notice + ". После смены ID сообщи об этом мастерам.")
             await self.ui.acknowledge(
                 "Возьми пустой шаблон и маркер. Наклей шаблон ВЗАМЕН старой наклейки.\n"
-                "Напиши имя и ID: " + formatted_id(self.op.new_id) + "\nНажми 1, когда закончишь.")
+                "Напиши имя и ID: " + formatted_id(self.op.new_id) + "\nВведи 1, когда закончишь.")
             self.go(Stage.VERIFY)
         elif s == Stage.VERIFY:
             value = await self.ui.ask("Введи ID, который ты написал на наклейке:")
@@ -872,7 +873,7 @@ def main():
         return 1
     except Exception:
         LOG.debug("Fatal failure", exc_info=True)
-        print("Работа остановлена. Если смена ID была начата, отправь владельца карты на мастерку.")
+        print("Фатальная ошибка, перезапусти программу. Если смена ID была начата, отправь владельца карты на мастерку.")
         return 1
 
 
